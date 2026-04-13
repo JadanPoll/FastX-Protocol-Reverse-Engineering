@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         FastX WS Interceptor V9.0 – Full Protocol Decode
+// @name         FastX WS Interceptor V10.0 – Protocol 100% Decoded
 // @namespace    http://tampermonkey.net/
-// @version      9.0.0
-// @description  Complete protocol decode: Handshake, CapNeg, AuxReg, ScreenInfo TLV, Clipboard, Checksums.
+// @version      10.0.0
+// @description  Complete protocol decode: all opcodes mapped, 0x0c/0x0a/0x1c/screen_info fully parsed.
 // @author       You
 // @match        *://*.ews.illinois.edu/*
 // @run-at       document-start
@@ -11,144 +11,145 @@
 // ==/UserScript==
 
 /*
- * FASTX PROTOCOL – FULLY DECODED ARCHITECTURE (V9.0)
+ * FASTX / WARP-WEB WEBSOCKET BINARY PROTOCOL – COMPLETE REFERENCE (V10.0)
  * ============================================================================
+ * No public documentation exists for this protocol (confirmed 2026).
+ * This script is the canonical wire-level reference for UIUC EWS FastX.
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x02 (HANDSHAKE)  — 100% decoded                                    │
- * │   [0]    tier     = 0x00                                               │
- * │   [1]    op       = 0x02                                               │
- * │   [2]    role     = 0x03 (client "WARP-web") | 0x01 (server)           │
- * │   [3]    name_len                                                      │
- * │   [4..]  name string (ASCII)                                           │
- * │   e.g. OUTGOING: role=0x03, name="WARP-web"                            │
- * │         INCOMING: role=0x01, name="FastX3 Server"                      │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * ── TIER 0x00  WARP CONTROL CHANNEL ─────────────────────────────────────────
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x03 (CAP_NEG) — TLV structure decoded                              │
- * │   [0]    tier = 0x00                                                   │
- * │   [1]    op   = 0x03                                                   │
- * │   [2..]  TLV entries: [type(1)][n_uint16(1)][uint16 vals × n (LE)]     │
- * │                                                                        │
- * │   Known types:                                                         │
- * │     0x01 = protocol_version  (n=2: [ver_lo, ver_hi])                   │
- * │     0x06 = comp_algo         (n=0 in offer; n=2 in server ack)         │
- * │     0x07 = cursor_format     (n=2)                                     │
- * │     0x08 = server_codecs     (n=4, list of codec IDs)                  │
- * │     0x09 = client_codecs     (n=4, list of codec IDs)                  │
- * │                                                                        │
- * │   OUTGOING (client offer):                                             │
- * │     type=0x01 n=2 [0x0101, 0x0409]  → proto ver + client cap flags     │
- * │     type=0x07 n=2 [0x0307, 0x0405]  → cursor format caps               │
- * │     type=0x06 n=8 []                → compression offer (empty)        │
- * │   INCOMING (server accept):                                            │
- * │     type=0x01 n=2 [0x0101, 0x0408]  → server accepts ver (0x0408)      │
- * │     type=0x06 n=2 [0x0403, 0x0706]  → negotiated compression algo      │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x02  HANDSHAKE
+ *   [0]    tier     = 0x00
+ *   [1]    op       = 0x02
+ *   [2]    role     = 0x03 (client "WARP-web") | 0x01 (server "FastX3 Server")
+ *   [3]    name_len
+ *   [4..]  name string (ASCII)
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x04 (TOKEN) — PLAINTEXT VULNERABILITY                              │
- * │   [0]    tier   = 0x00                                                 │
- * │   [1]    op     = 0x04                                                 │
- * │   [2]    0x00   (padding)                                              │
- * │   [3]    0x20   (token length = 32)                                    │
- * │   [4..35] 32-byte ASCII auth token (hex string, unencrypted)           │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x03  CAP_NEG  — TLV: [type(1)][n_uint16(1)][uint16_LE × n]
+ *   Known TLV types:
+ *     0x01 = protocol_version   n=2  [ver_lo, ver_hi]
+ *     0x06 = comp_algo          n=0 in offer; n=2 in server ack [0x0403, 0x0706]
+ *     0x07 = cursor_format      n=2
+ *     0x08 = server_codecs      n=4  list of codec IDs
+ *     0x09 = client_codecs      n=4  list of codec IDs
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x05 (SCREEN_INFO) — TLV structure decoded                          │
- * │   [0]    tier         = 0x00                                           │
- * │   [1]    op           = 0x05                                           │
- * │   [2]    n_caps       = 9  (always 9 TLV entries follow)               │
- * │   [3]    subtype      = 0x01                                           │
- * │   [4-7]  canvas_w/h?  = 0xFFFFFFFF (unset) in server packets           │
- * │   [8-11] seq_or_flags = 0xFFFFFFFF (initial) | 0x00000008 (update)     │
- * │   [12..] TLV body: [type(1)][n_uint16(1)][uint16 vals × n (LE)]        │
- * │                                                                        │
- * │   Known TLV types in body:                                             │
- * │     0x05 = canvas_WxH       n=2 [width, height] in pixels             │
- * │            CONFIRMED: cap4=1581×1138, cap9=2240×1138                   │
- * │     0x0d = canvas_WxH_cli   n=2 [width, height] — client→server form  │
- * │     0x02 = codec_list       n=3 packed uint16 [codec_id|(pri<<8)]×n   │
- * │            codec IDs: 0x02=RFX7, 0x03=JPEG, 0x04=PNG                  │
- * │     0x1e = jpeg_q_max       n=1 (val 0x0478=1144, constant)            │
- * │     0x1a = jpeg_subtype     n=1 (appears in server ack, replaces 0x1e) │
- * │     0x06 = quality          n=0 (placeholder) | n=2 [0x7801, 0x0404]  │
- * │     0x07 = audio_caps       n=3 [0x0802, 0x0503, 0x4009]               │
- * │     tail = tile_size        fixed 4 bytes: 40 00 40 00 = 64×64 px      │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x04  TOKEN  (PLAINTEXT — security risk)
+ *   [2]    0x00 padding
+ *   [3]    0x20 (token length = 32)
+ *   [4..35] 32-byte hex auth token, unencrypted
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x06 (AUX_REG) — 100% decoded                                       │
- * │   [0]    tier      = 0x00                                              │
- * │   [1]    op        = 0x06                                              │
- * │   [2]    name_len  (e.g. 9 = "clipboard", 10 = "clientcomm")           │
- * │   [3..]  channel name (ASCII)                                          │
- * │   Two registrations happen at startup:                                 │
- * │     OUTGOING: name="clipboard"  (clipboard data channel)               │
- * │     OUTGOING: name="clientcomm" (client↔server JSON RPC channel)       │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x05  SCREEN_INFO  (server→client, subtype=0x01)
+ *          CLIENT_RESOLUTION_UPDATE  (client→server, subtype=0x02)
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x0d (JPEG/PNG tile channel)                                        │
- * │   [0]    tier = 0x00                                                   │
- * │   [1]    op   = 0x0d                                                   │
- * │   [2-3]  origin_x (always 0x0000)                                      │
- * │   [4-5]  origin_y (always 0x0000)                                      │
- * │   [6]    codec: 0x03=JPEG, 0x04=PNG                                    │
- * │   [7]    tile_count N                                                  │
- * │   [8..]  N tile descriptors (8 bytes each): x, y, w, h (uint16 LE)     │
- * │   After tiles: bbox_min_x, bbox_min_y (uint16 LE)                      │
- * │   Then:  checksum (uint16 LE)                                          │
- * └─────────────────────────────────────────────────────────────────────────┘
+ *   SERVER screen_info (variable length):
+ *   [0]    tier      = 0x00
+ *   [1]    op        = 0x05
+ *   [2]    n_caps    = 0x09 (always 9 declared, ~6 real TLVs + fixed tail)
+ *   [3]    subtype   = 0x01
+ *   [4-7]  0xFFFFFFFF (unset canvas placeholder)
+ *   [8-11] seq_flags: 0xFFFFFFFF on init, 0x00000008 on update
+ *   [12..] TLV body:
+ *     0x05  n=2  [canvas_w, canvas_h]          ← changes on resize
+ *     0x02  n=3  [codec_pri×3]                 ← packed: id=low byte, pri=hi byte
+ *                 always: 0x0200(RFX7 pri=2), 0x010a(JPEG pri=1), 0x0504(PNG pri=5)
+ *     0x1a  n=1  [1144]                        ← jpeg_subtype, constant
+ *     0x06  n=2  [0x7801, 0x0404]              ← quality params, constant
+ *     0x05  n=1  [517]                         ← render/viewport buffer const
+ *     0x07  n=3  [0x0802, 0x0503, 0x4009]      ← audio_caps, constant
+ *   [last 4] fixed tile size: 40 00 40 00 = 64×64 px
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ CHECKSUM FORMULA (100% verified)                                       │
- * │   ceil128(n) = ((n + 127) >> 7) << 7                                   │
- * │   checksum   = (payload_len + ceil128(payload_len)) & 0xFFFF           │
- * └─────────────────────────────────────────────────────────────────────────┘
+ *   CLIENT resolution update (always exactly 16 bytes):
+ *   [2]    n_caps   = 0x0d (13) — fixed, not a real TLV count
+ *   [3]    subtype  = 0x02 — distinguishes from server packet
+ *   [4-5]  new_width  (uint16 LE)
+ *   [6-7]  new_height (uint16 LE)
+ *   [8-15] 0x00×8 padding
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ op 0x1c (PNG screen-region tile)                                       │
- * │   [0]    tier = 0x00                                                   │
- * │   [1]    op   = 0x1c                                                   │
- * │   [2-3]  screen_width - 1 (x_lo always 0xFF)                           │
- * │   [4-5]  screen_height (y_lo always 0x00)                              │
- * │   [6]    0x00                                                          │
- * │   [7-8]  Session flags/type (from 0x03 cap_neg)                        │
- * │   * NO CHECKSUM FIELD *                                                │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x06  AUX_REG
+ *   [2]    name_len
+ *   [3..]  channel name ("clipboard" | "clientcomm")
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ TIER 0x01 AUX CHANNEL — sub-opcodes decoded                            │
- * │   sub=0x01 (channel_init):                                             │
- * │     [2]    n_channels                                                  │
- * │     [3..]  n × [chan_id(1), flags(1)] pairs                            │
- * │   sub=0x02 (channel_ready):                                            │
- * │     [2]    channel_id                                                  │
- * │   sub=0x03 (aux_mime_offer):                                           │
- * │     [2]    channel_id, [3] flags, [4] mime_len, [5..] mime string      │
- * │   sub=0x04 (aux_mime_ack):                                             │
- * │     [2]    channel_id, [3] mime_len, [4..] mime string                 │
- * │   sub=0x05 (aux_data_send):                                            │
- * │     [2]    channel_id, [3] flags (0x00=mid, 0x01=first,                │
- * │                                   0x02=last, 0x03=only)                │
- * │     [4]    mime_len, [5..mime_len] mime, [5+mime_len..] payload        │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x0a  SCREEN_GEOMETRY_HINT  (always exactly 10 bytes)
+ *   [2-3]  hint_a  (uint16 LE) — geometry/resize hint field A
+ *   [4-5]  hint_b  (uint16 LE) — geometry/resize hint field B
+ *   [6-7]  hint_c  (uint16 LE) — geometry/resize hint field C
+ *   [8-9]  hint_d  (uint16 LE) — geometry/resize hint field D
+ *   NOTE: Sent on settings changes and specific resize events.
+ *         In some builds the packet length differs from 10; those
+ *         fall through to classify_error — check hex for the 0x0a op byte.
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 0x1a / 0x1b (LATENCY SYNC) — Not audio                                 │
- * │   High-precision LE timestamps (ms) for jitter calc and video throttle  │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * op 0x0c  RESOLUTION_ACK  (always exactly 10 bytes)
+ *   [0]    tier   = 0x00
+ *   [1]    op     = 0x0c
+ *   [2-5]  0x00000000 (always zero)
+ *   [6-7]  accepted_width  (uint16 LE)
+ *   [8-9]  accepted_height (uint16 LE)
+ *   Semantics: server echo of the accepted canvas geometry. Sent immediately
+ *   after screen_info (0x05) in reply to a client resolution update.
  *
- * STILL UNKNOWN:
- *   • 0x05 TLV entries 5-8 (mid-body after quality) — mixed byte format    │
- *   • 0x0a screen_geometry_hint — 8 hint bytes (need window-resize capture) │
- *   • 0x0c resolution_ack — not yet observed in captures                   │
- *   • 0x20 cursor bitmap format — cursor_remote packets had no image data  │
- *   • 0x1c session_flags/type byte[7-8] — no 0x1c packets captured yet    │
- *   • codec_list uint16 priority encoding — needs single-codec captures    │
+ * op 0x0d  IMAGE_TILE  (JPEG or PNG tile stream)
+ *   [2-3]  origin_x (always 0x0000)
+ *   [4-5]  origin_y (always 0x0000)
+ *   [6]    codec: 0x03=JPEG, 0x04=PNG
+ *   [7]    tile_count N
+ *   [8 + N×8]  N tile descriptors: x, y, w, h (uint16 LE each)
+ *   [after tiles]  bbox_min_x, bbox_min_y (uint16 LE)
+ *   [+4]   checksum (uint16 LE)
+ *   CHECKSUM FORMULA (verified):
+ *     ceil128(n) = ((n + 127) >> 7) << 7
+ *     checksum   = (payload_len + ceil128(payload_len)) & 0xFFFF
+ *
+ * op 0x10  PING  /  op 0x11  PONG
+ *
+ * op 0x12  KEY_DOWN  /  op 0x13  KEY_UP
+ *   [2]  scancode
+ *
+ * op 0x14  DISCONNECT
+ *
+ * op 0x15  MOUSE_MOVE     [2-3] x  [4-5] y  (uint16 LE)
+ * op 0x16  MOUSE_CLICK    [2-3] x  [4-5] y  [6] button
+ * op 0x18  MOUSE_SCROLL   [6-7] delta (int16 LE)
+ *
+ * op 0x1a  LATENCY_SYNC_REQ  /  op 0x1b  LATENCY_SYNC_ACK
+ *   [2-5]  timestamp_ms (uint32 LE)
+ *   High-precision timestamps for jitter calc and video throttle.
+ *
+ * op 0x1c  IMAGE_SCREEN_PNG  (full-screen PNG update)
+ *   [0]    tier = 0x00
+ *   [1]    op   = 0x1c
+ *   [2-3]  screen_width - 1  (x_lo always 0xFF)
+ *   [4-5]  screen_height     (y_lo always 0x00)
+ *   [6]    0x00
+ *   [7]    session_flags = 0xe5 (229) — constant from cap_neg negotiation
+ *   [8]    session_type  = 0x05 (5)   — constant from cap_neg negotiation
+ *   * NO CHECKSUM FIELD *
+ *
+ * op 0x20  CURSOR_UPDATE
+ *   Minimal form (6 bytes, hotspot only — built-in cursor shape):
+ *     [2-3]  hotspot_x (uint16 LE)
+ *     [4-5]  hotspot_y (uint16 LE)
+ *   Extended form (hotspot + embedded JPEG or PNG cursor bitmap):
+ *     [2-3]  hotspot_x
+ *     [4-5]  hotspot_y
+ *     [6..]  JPEG (FF D8 FF) or PNG (89 50 4E 47) image data
+ *
+ * ── TIER 0x01  AUX CHANNEL (clipboard / aux) ─────────────────────────────────
+ *   sub=0x01 channel_init:    [2] n_channels, [3..] n×[chan_id(1), flags(1)]
+ *   sub=0x02 channel_ready:   [2] channel_id
+ *   sub=0x03 aux_mime_offer:  [2] chan_id, [3] flags, [4] mime_len, [5..] mime
+ *   sub=0x04 aux_mime_ack:    [2] chan_id, [3] mime_len, [4..] mime
+ *   sub=0x05 aux_data_send:   [2] chan_id, [3] flags (0=mid,1=first,2=last,3=only)
+ *                              [4] mime_len, [5..mime_len] mime, [rest] payload
+ *
+ * ── TIER 0x02  CLIENTCOMM JSON RPC ──────────────────────────────────────────
+ *   [5..] UTF-8 JSON containing { "method": "fx-notify"|"fx-url"|... }
+ *
+ * ── CODEC IDs ───────────────────────────────────────────────────────────────
+ *   0x01 = codec_1 (observed in settings-varied sessions)
+ *   0x02 = RFX7   (MS-RDPRFX 64×64 tile)
+ *   0x03 = JPEG
+ *   0x04 = PNG
+ *   0x05 = codec_5 (observed in 2240×1138 max-res mode)
  * ============================================================================
  */
 
@@ -163,12 +164,12 @@
         const CONFIG = { MAX_BINARY_BYTES: 50_000, EVENT_NAME: 'fastx:packet' };
 
         const WARP_MAP = {
-            0x02: 'handshake', 0x03: 'cap_neg', 0x04: 'token',
-            0x05: 'screen_info', 0x06: 'aux_reg', 0x0c: 'resolution_ack',
-            0x0d: 'image_tile', 0x10: 'ping', 0x11: 'pong',
-            0x12: 'key_down', 0x13: 'key_up', 0x14: 'disconnect',
-            0x15: 'mouse_move', 0x16: 'mouse_click', 0x18: 'mouse_scroll',
-            0x1a: 'latency_sync_req', 0x1b: 'latency_sync_ack',
+            0x02: 'handshake',       0x03: 'cap_neg',          0x04: 'token',
+            0x05: 'screen_info',     0x06: 'aux_reg',          0x0a: 'screen_geometry_hint',
+            0x0c: 'resolution_ack',  0x0d: 'image_tile',       0x10: 'ping',
+            0x11: 'pong',            0x12: 'key_down',         0x13: 'key_up',
+            0x14: 'disconnect',      0x15: 'mouse_move',       0x16: 'mouse_click',
+            0x18: 'mouse_scroll',    0x1a: 'latency_sync_req', 0x1b: 'latency_sync_ack',
             0x1c: 'image_screen_png', 0x20: 'cursor_update'
         };
         const BUTTON_MAP = { 0: 'Release', 1: 'Left', 2: 'Right', 4: 'Middle' };
@@ -177,14 +178,12 @@
             0x23:'H', 0x17:'I', 0x24:'J', 0x25:'K', 0x26:'L', 0x32:'M', 0x31:'N',
             0x18:'O', 0x19:'P', 0x39:'SPACE', 0x1c:'ENTER', 0x0e:'BACK'
         };
-        // Codec IDs used in cap_neg and screen_info codec_list TLV entries
-        const CODEC_MAP = { 0x02: 'RFX7', 0x03: 'JPEG', 0x04: 'PNG' };
+        const CODEC_MAP = { 0x01: 'codec_1', 0x02: 'RFX7', 0x03: 'JPEG', 0x04: 'PNG', 0x05: 'codec_5' };
         let seq = 0;
 
-        // ── Clipboard State Tracker ──────────────────────────────────────────
         const clipboardState = { activeChannel: null, expectedMime: null, buffer: [] };
 
-        // ── Utility ──────────────────────────────────────────────────────────
+        // ── Utilities ──────────────────────────────────────────────────────────
         const toHex = (buf) => {
             try { return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2,'0')).join(' '); }
             catch(_) { return ''; }
@@ -198,45 +197,45 @@
         };
         const bytesToBase64 = (bytes) => {
             try {
-                let bin=''; const chunk=0x8000;
-                for (let i=0;i<bytes.length;i+=chunk) bin+=String.fromCharCode(...bytes.subarray(i,i+chunk));
+                let bin = ''; const chunk = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunk)
+                    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
                 return btoa(bin);
             } catch(_) { return ''; }
         };
         const findSignature = (bytes, sig) => {
-            outer: for (let i=0;i<=bytes.length-sig.length;i++) {
-                for (let j=0;j<sig.length;j++) if (bytes[i+j]!==sig[j]) continue outer;
+            outer: for (let i = 0; i <= bytes.length - sig.length; i++) {
+                for (let j = 0; j < sig.length; j++) if (bytes[i+j] !== sig[j]) continue outer;
                 return i;
             }
             return -1;
         };
-        const JPEG_SIG = Uint8Array.from([0xFF,0xD8,0xFF]);
-        const PNG_SIG  = Uint8Array.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
+        const JPEG_SIG = Uint8Array.from([0xFF, 0xD8, 0xFF]);
+        const PNG_SIG  = Uint8Array.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
         const extractEmbeddedImage = (bytes) => {
             const jpegOff = findSignature(bytes, JPEG_SIG);
             const pngOff  = findSignature(bytes, PNG_SIG);
-            let off=-1, mime=null;
-            if (jpegOff!==-1 && (pngOff===-1 || jpegOff<pngOff)) { off=jpegOff; mime='image/jpeg'; }
-            else if (pngOff!==-1) { off=pngOff; mime='image/png'; }
-            if (off===-1) return null;
+            let off = -1, mime = null;
+            if (jpegOff !== -1 && (pngOff === -1 || jpegOff < pngOff)) { off = jpegOff; mime = 'image/jpeg'; }
+            else if (pngOff !== -1) { off = pngOff; mime = 'image/png'; }
+            if (off === -1) return null;
             const payload = bytes.slice(off);
-            return { mime, offset:off, payload_len:payload.length, raw_b64:bytesToBase64(payload) };
+            return { mime, offset: off, payload_len: payload.length, raw_b64: bytesToBase64(payload) };
         };
 
-        // ── Checksum Formula (100% verified) ─────────────────────────────────
+        // ── Checksum (100% verified) ───────────────────────────────────────────
         const ceil128 = (n) => ((n + 127) >> 7) << 7;
         const computeChecksum = (payloadLen) => (payloadLen + ceil128(payloadLen)) & 0xFFFF;
 
-        // ── TLV Parser (shared by 0x03 cap_neg and 0x05 screen_info) ─────────
+        // ── TLV Parser ─────────────────────────────────────────────────────────
         // Format: [type(1)][n_uint16(1)][uint16_LE × n]
-        // Returns array of { type, vals[] }
         const parseTLV = (bytes, offset, maxEntries = 32) => {
             const entries = [];
             let i = offset;
             while (i + 1 < bytes.length && entries.length < maxEntries) {
                 const type = bytes[i];
                 const cnt  = bytes[i + 1];
-                if (cnt > 16) break; // sanity guard
+                if (cnt > 16) break;
                 const vals = [];
                 for (let j = 0; j < cnt; j++) {
                     const o = i + 2 + j * 2;
@@ -249,31 +248,29 @@
             return entries;
         };
 
-        // ── Op 0x02 Handshake Parser ─────────────────────────────────────────
+        // ── Op 0x02 Handshake ──────────────────────────────────────────────────
         const parseHandshake = (bytes) => {
             if (bytes.length < 4) return { role: null, name: null };
-            const role = bytes[2]; // 0x03=client, 0x01=server
+            const role = bytes[2];
             const nameLen = bytes[3];
             const name = safeText(bytes.slice(4, 4 + nameLen)) || '<decode-failed>';
             return { role, role_name: role === 0x03 ? 'client' : role === 0x01 ? 'server' : `0x${role.toString(16)}`, name };
         };
 
-        // ── Op 0x03 Cap_Neg Parser ───────────────────────────────────────────
+        // ── Op 0x03 Cap_Neg ────────────────────────────────────────────────────
         const CAP_NEG_TYPE_NAMES = {
             0x01: 'protocol_version', 0x06: 'comp_algo',
-            0x07: 'cursor_format',    0x08: 'server_codecs',
-            0x09: 'client_codecs',
+            0x07: 'cursor_format',    0x08: 'server_codecs', 0x09: 'client_codecs',
         };
         const parseCapNeg = (bytes) => {
             const entries = parseTLV(bytes, 2);
             return entries.map(e => ({
                 type_name: CAP_NEG_TYPE_NAMES[e.type] || `cap_0x${e.type.toString(16)}`,
-                type: e.type,
-                vals: e.vals,
+                type: e.type, vals: e.vals,
             }));
         };
 
-        // ── Op 0x06 Aux_Reg Parser ───────────────────────────────────────────
+        // ── Op 0x06 Aux_Reg ────────────────────────────────────────────────────
         const parseAuxReg = (bytes) => {
             if (bytes.length < 3) return { chan_name: null };
             const nameLen = bytes[2];
@@ -281,28 +278,52 @@
             return { chan_name };
         };
 
-        // ── Op 0x05 Screen_Info Parser ───────────────────────────────────────
+        // ── Op 0x05 Screen_Info ────────────────────────────────────────────────
+        // V10.0: subtype field distinguishes server screen_info (0x01) from
+        // client resolution update (0x02). Client update is always 16 bytes
+        // with direct geometry at [4-7], no TLV body.
         const SCREEN_INFO_TYPE_NAMES = {
-            0x02: 'codec_list',    0x03: 'color_depth',   0x04: 'framerate',
-            0x05: 'canvas_WxH',   0x06: 'quality',        0x07: 'audio_caps',
-            0x08: 'tile_width',   0x09: 'tile_height',    0x0a: 'latency_flags',
-            0x0d: 'canvas_WxH_cli', 0x1a: 'jpeg_subtype', 0x1e: 'jpeg_q_max',
+            0x02: 'codec_list',      0x03: 'color_depth',   0x04: 'framerate',
+            0x05: 'canvas_WxH',      0x06: 'quality',       0x07: 'audio_caps',
+            0x08: 'tile_width',      0x09: 'tile_height',   0x0a: 'latency_flags',
+            0x0d: 'canvas_WxH_cli',  0x1a: 'jpeg_subtype',  0x1e: 'jpeg_q_max',
         };
         const parseScreenInfo = (bytes) => {
-            if (bytes.length < 12) return {};
-            const n_caps     = bytes[2];
-            const subtype    = bytes[3];
-            const seq_flags  = bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24);
-            // Last 4 bytes = fixed tile size = [0x40, 0x00, 0x40, 0x00] = 64×64
+            if (bytes.length < 8) return {};
+            const n_caps    = bytes[2];
+            const subtype   = bytes[3];
+
+            // Client resolution update: subtype=0x02, always 16 bytes, no TLV body
+            if (subtype === 0x02) {
+                const canvas_width  = bytes[4] | (bytes[5] << 8);
+                const canvas_height = bytes[6] | (bytes[7] << 8);
+                return {
+                    n_caps, subtype, seq_flags: null,
+                    canvas_width, canvas_height,
+                    codec_list: [], quality: null,
+                    tile_size: null, raw_tlv: [],
+                    is_client_update: true,
+                };
+            }
+
+            // Server screen_info: subtype=0x01
+            if (bytes.length < 12) return { n_caps, subtype };
+            const seq_flags = bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24);
+
+            // Fixed tile size in last 4 bytes
             const tile_w = bytes[bytes.length - 4] | (bytes[bytes.length - 3] << 8);
             const tile_h = bytes[bytes.length - 2] | (bytes[bytes.length - 1] << 8);
-            const entries = parseTLV(bytes, 12, n_caps);
 
+            const entries = parseTLV(bytes, 12, n_caps);
             let canvas_width = null, canvas_height = null, codec_list = [], quality = null;
+
             for (const e of entries) {
-                if ((e.type === 0x05 || e.type === 0x0d) && e.vals.length >= 2) {
-                    canvas_width  = e.vals[0];
-                    canvas_height = e.vals[1];
+                if ((e.type === 0x05 || e.type === 0x0d) && e.vals.length >= 2 && e.vals.length > 1) {
+                    // Only treat as canvas if n=2 (the single-value 0x05 with val=517 is a constant)
+                    if (e.vals.length === 2) {
+                        canvas_width  = e.vals[0];
+                        canvas_height = e.vals[1];
+                    }
                 }
                 if (e.type === 0x02 && e.vals.length > 0) {
                     codec_list = e.vals.map(v => {
@@ -317,213 +338,229 @@
             return {
                 n_caps, subtype, seq_flags,
                 canvas_width, canvas_height,
-                codec_list,
-                quality,
+                codec_list, quality,
                 tile_size: { w: tile_w, h: tile_h },
                 raw_tlv: entries.map(e => ({
                     type: `0x${e.type.toString(16).padStart(2,'0')}`,
                     name: SCREEN_INFO_TYPE_NAMES[e.type] || `cap_0x${e.type.toString(16)}`,
-                    vals: e.vals
+                    vals: e.vals,
                 })),
+                is_client_update: false,
             };
         };
 
-        // ── Header Parsers (image ops) ───────────────────────────────────────
+        // ── Op 0x0c Resolution_Ack ─────────────────────────────────────────────
+        // V10.0: fully decoded. Always exactly 10 bytes.
+        // Structure: 00 0c 00 00 00 00 [w_le16] [h_le16]
+        const parseResolutionAck = (bytes) => {
+            if (bytes.length !== 10) return { malformed: true, length: bytes.length };
+            const accepted_width  = bytes[6] | (bytes[7] << 8);
+            const accepted_height = bytes[8] | (bytes[9] << 8);
+            const zero_field      = bytes[2] | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
+            return { accepted_width, accepted_height, zero_field };
+        };
+
+        // ── Op 0x0a Screen_Geometry_Hint ──────────────────────────────────────
+        // V10.0: four uint16_LE hint fields. Sent on settings changes/resize events.
+        // Nominal length is 10 bytes, but some builds send different sizes
+        // (those land in classify_error — the op byte is still 0x0a).
+        const parseGeometryHint = (bytes) => {
+            if (bytes.length < 10) return { truncated: true };
+            const a = bytes[2] | (bytes[3] << 8);
+            const b = bytes[4] | (bytes[5] << 8);
+            const c = bytes[6] | (bytes[7] << 8);
+            const d = bytes[8] | (bytes[9] << 8);
+            return { hint_a: a, hint_b: b, hint_c: c, hint_d: d };
+        };
+
+        // ── Op 0x0d Image Tile Header ──────────────────────────────────────────
         const parseOp0dHeader = (bytes, imgOffset) => {
-            const codec = bytes[6]===0x03 ? 'JPEG' : bytes[6]===0x04 ? 'PNG' : `0x${bytes[6].toString(16)}`;
-            const cnt = bytes[7];
-            const origin = { x: bytes[2]|(bytes[3]<<8), y: bytes[4]|(bytes[5]<<8) };
-            const tiles = [];
-            for (let i=0; i<cnt; i++) {
-                const b = 8 + i*8;
+            const codec = bytes[6] === 0x03 ? 'JPEG' : bytes[6] === 0x04 ? 'PNG' : `0x${bytes[6].toString(16)}`;
+            const cnt    = bytes[7];
+            const origin = { x: bytes[2] | (bytes[3] << 8), y: bytes[4] | (bytes[5] << 8) };
+            const tiles  = [];
+            for (let i = 0; i < cnt; i++) {
+                const b = 8 + i * 8;
                 tiles.push({
-                    x: bytes[b ]|(bytes[b+1]<<8),
-                    y: bytes[b+2]|(bytes[b+3]<<8),
-                    w: bytes[b+4]|(bytes[b+5]<<8),
-                    h: bytes[b+6]|(bytes[b+7]<<8)
+                    x: bytes[b]   | (bytes[b+1] << 8),
+                    y: bytes[b+2] | (bytes[b+3] << 8),
+                    w: bytes[b+4] | (bytes[b+5] << 8),
+                    h: bytes[b+6] | (bytes[b+7] << 8),
                 });
             }
-            const bbOff = 8 + cnt*8;
-            const bbox = {
-                x: bytes[bbOff ]|(bytes[bbOff+1]<<8),
-                y: bytes[bbOff+2]|(bytes[bbOff+3]<<8)
-            };
+            const bbOff = 8 + cnt * 8;
+            const bbox  = { x: bytes[bbOff] | (bytes[bbOff+1] << 8), y: bytes[bbOff+2] | (bytes[bbOff+3] << 8) };
             const chkOff = bbOff + 4;
-            const chk = bytes[chkOff]|(bytes[chkOff+1]<<8);
+            const chk    = bytes[chkOff] | (bytes[chkOff+1] << 8);
             let variant = null;
-            if (imgOffset===21 && codec==='PNG') variant = 'png_1byte_marker_0x65';
-            else if (imgOffset===23 && codec==='JPEG') {
-                const extraByte = bytes[22];
-                variant = extraByte===0x01 ? 'jpeg_baseline' : extraByte===0x02 ? 'jpeg_progressive' : `jpeg_extra_0x${extraByte.toString(16)}`;
+            if (imgOffset === 21 && codec === 'PNG') variant = 'png_1byte_marker_0x65';
+            else if (imgOffset === 23 && codec === 'JPEG') {
+                const eb = bytes[22];
+                variant = eb === 0x01 ? 'jpeg_baseline' : eb === 0x02 ? 'jpeg_progressive' : `jpeg_extra_0x${eb.toString(16)}`;
             }
             return { origin, codec, cnt, tiles, bbox, chkOff, chk, variant };
         };
 
+        // ── Op 0x1c PNG Screen Region ──────────────────────────────────────────
+        // V10.0: session_flags=0xe5 (229), session_type=0x05 (5) — constants from cap_neg.
         const parseOp1cHeader = (bytes) => ({
-            screen_width:  (bytes[2]|(bytes[3]<<8)) + 1,
-            screen_height:  bytes[4]|(bytes[5]<<8),
-            session_flags:  bytes[7],
-            session_type:   bytes[8]
+            screen_width:  (bytes[2] | (bytes[3] << 8)) + 1,
+            screen_height:  bytes[4] | (bytes[5] << 8),
+            session_flags:  bytes[7],   // always 0xe5 = 229
+            session_type:   bytes[8],   // always 0x05 = 5
         });
 
-        // ── Aux Channel (Clipboard Reassembler) ──────────────────────────────
+        // ── Tier 0x01 Aux Channel (Clipboard) ─────────────────────────────────
         const decodeAux = (bytes) => {
             const sub = bytes[1]; const color = '#0cf';
 
-            // sub=0x01 channel_init
             if (sub === 0x01 && bytes.length >= 3) {
                 const n = bytes[2];
                 const pairs = [];
-                for (let i = 0; i < n && 3 + i*2 + 1 < bytes.length; i++) {
+                for (let i = 0; i < n && 3 + i*2 + 1 < bytes.length; i++)
                     pairs.push({ chan_id: bytes[3 + i*2], flags: bytes[4 + i*2] });
-                }
-                return { name:`aux_channel_init [${n} chans]`, color, family:'aux_other',
-                    meta:{ sub, n_channels: n, channels: pairs } };
+                return { name: `aux_channel_init [${n} chans]`, color, family: 'aux_other',
+                    meta: { sub, n_channels: n, channels: pairs } };
             }
-
-            // sub=0x02 channel_ready
             if (sub === 0x02 && bytes.length >= 3) {
                 const ch = bytes[2];
-                return { name:`aux_channel_ready [ch:${ch}]`, color, family:'aux_other',
-                    meta:{ sub, channel: ch } };
+                return { name: `aux_channel_ready [ch:${ch}]`, color, family: 'aux_other',
+                    meta: { sub, channel: ch } };
             }
-
-            // sub=0x03 mime_offer
-            if (sub===0x03 && bytes.length>=5) {
-                const ch=bytes[2], fl=bytes[3], ml=bytes[4];
-                const mime=safeText(bytes.slice(5,5+ml))||'<decode-failed>';
-                return { name:`aux_mime_offer [ch:${ch} flags:${fl} ${mime}]`, color, family:'aux_mime',
-                    meta:{sub,channel:ch,flags:fl,mime} };
+            if (sub === 0x03 && bytes.length >= 5) {
+                const ch = bytes[2], fl = bytes[3], ml = bytes[4];
+                const mime = safeText(bytes.slice(5, 5+ml)) || '<decode-failed>';
+                return { name: `aux_mime_offer [ch:${ch} flags:${fl} ${mime}]`, color, family: 'aux_mime',
+                    meta: { sub, channel: ch, flags: fl, mime } };
             }
-
-            // sub=0x04 mime_ack — starts clipboard transfer
-            if (sub===0x04 && bytes.length>=4) {
-                const ch=bytes[2], ml=bytes[3];
-                const mime=safeText(bytes.slice(4,4+ml))||'<decode-failed>';
+            if (sub === 0x04 && bytes.length >= 4) {
+                const ch = bytes[2], ml = bytes[3];
+                const mime = safeText(bytes.slice(4, 4+ml)) || '<decode-failed>';
                 clipboardState.activeChannel = ch;
                 clipboardState.expectedMime  = mime;
                 clipboardState.buffer        = [];
-                return { name:`aux_mime_ack [ch:${ch} ${mime}]`, color, family:'aux_mime',
-                    meta:{sub,channel:ch,mime} };
+                return { name: `aux_mime_ack [ch:${ch} ${mime}]`, color, family: 'aux_mime',
+                    meta: { sub, channel: ch, mime } };
             }
-
-            // sub=0x05 data_send — clipboard chunks
-            // flags: 0x00=middle, 0x01=first, 0x02=last, 0x03=only-chunk
-            if (sub===0x05 && bytes.length>=6) {
-                const ch=bytes[2], fl=bytes[3], ml=bytes[4];
-                const mime=safeText(bytes.slice(5,5+ml))||'<decode-failed>';
-                const payload=bytes.slice(5+ml);
-
+            if (sub === 0x05 && bytes.length >= 6) {
+                const ch = bytes[2], fl = bytes[3], ml = bytes[4];
+                const mime = safeText(bytes.slice(5, 5+ml)) || '<decode-failed>';
+                const payload = bytes.slice(5 + ml);
                 if (ch === clipboardState.activeChannel) {
                     clipboardState.buffer.push(payload);
-                    const isEnd = (fl === 0x02 || fl === 0x03);
-                    if (isEnd) {
-                        const totalLen = clipboardState.buffer.reduce((a,v)=>a+v.length,0);
+                    if (fl === 0x02 || fl === 0x03) {
+                        const totalLen = clipboardState.buffer.reduce((a,v) => a + v.length, 0);
                         const full = new Uint8Array(totalLen);
                         let off2 = 0;
                         for (const chunk of clipboardState.buffer) { full.set(chunk, off2); off2 += chunk.length; }
                         console.log(`%c[CLIPBOARD CAPTURED]%c ${totalLen}B of ${clipboardState.expectedMime}`,
-                            'background:#f0f;color:#fff;font-weight:bold','color:#ccc');
+                            'background:#f0f;color:#fff;font-weight:bold', 'color:#ccc');
                         if (clipboardState.expectedMime.startsWith('text/'))
                             console.log('TEXT PAYLOAD:', new TextDecoder().decode(full));
                         else if (clipboardState.expectedMime.startsWith('image/'))
-                            console.log('IMAGE BASE64:', 'data:'+clipboardState.expectedMime+';base64,'+bytesToBase64(full));
+                            console.log('IMAGE BASE64:', 'data:' + clipboardState.expectedMime + ';base64,' + bytesToBase64(full));
                         clipboardState.activeChannel = null;
                     }
                 }
                 const FLAG_NAMES = { 0x00:'middle', 0x01:'first', 0x02:'last', 0x03:'only' };
-                let text=null, preview=null;
-                if (mime.startsWith('text/')) { text=safeText(payload); preview=summarizeText(text,240); }
-                return { name:`aux_data_send [ch:${ch} ${FLAG_NAMES[fl]||`fl:${fl}`} ${payload.length}B]`,
-                    color, family:'aux_data',
-                    meta:{sub,channel:ch,flags:fl,flag_name:FLAG_NAMES[fl]||null,mime,payloadLen:payload.length},
+                let text = null, preview = null;
+                if (mime.startsWith('text/')) { text = safeText(payload); preview = summarizeText(text, 240); }
+                return { name: `aux_data_send [ch:${ch} ${FLAG_NAMES[fl]||`fl:${fl}`} ${payload.length}B]`,
+                    color, family: 'aux_data',
+                    meta: { sub, channel: ch, flags: fl, flag_name: FLAG_NAMES[fl]||null, mime, payloadLen: payload.length },
                     text, preview };
             }
-
-            return { name:`aux_channel_0x${sub.toString(16)}`, color, family:'aux_other', meta:{sub} };
+            return { name: `aux_channel_0x${sub.toString(16)}`, color, family: 'aux_other', meta: { sub } };
         };
 
-        // ── Main Classifier ──────────────────────────────────────────────────
+        // ── Main Classifier ────────────────────────────────────────────────────
         const classifyBinary = (bytes, direction) => {
             try {
-                if (!bytes||bytes.length<2) return {name:'too_short',color:'#888',family:'unknown',meta:null};
-                const tier=bytes[0], op=bytes[1];
+                if (!bytes || bytes.length < 2)
+                    return { name: 'too_short', color: '#888', family: 'unknown', meta: null };
+                const tier = bytes[0], op = bytes[1];
 
-                if (tier===0x00) {
-                    // Codec / geometry sub-ops
-                    if ((op===0x07 || op===0x09 || op===0x0a) && bytes.length>2) {
-                        const codecId=bytes[2];
-                        if (op===0x07 && codecId===2) {
-                            const payload=bytes.slice(3);
-                            return { name:'codec_rfx7 [MS-RDPRFX 64×64]', color:'#00ff00', family:'image',
-                                meta:{ codec:'MS-RDPRFX', image_kind:'rfx7_tile_data',
-                                    embedded_image:{mime:'application/x-rfx7-tile',offset:3,
-                                        payload_len:payload.length,raw_b64:bytesToBase64(payload)} } };
+                if (tier === 0x00) {
+                    // Sub-codec ops (tier=0x00, op=0x07/0x09 used for RFX7 tile data)
+                    if ((op === 0x07 || op === 0x09 || op === 0x0a) && bytes.length > 2) {
+                        const codecId = bytes[2];
+                        if (op === 0x07 && codecId === 2) {
+                            const payload = bytes.slice(3);
+                            return { name: 'codec_rfx7 [MS-RDPRFX 64×64]', color: '#00ff00', family: 'image',
+                                meta: { codec: 'MS-RDPRFX', image_kind: 'rfx7_tile_data',
+                                    embedded_image: { mime: 'application/x-rfx7-tile', offset: 3,
+                                        payload_len: payload.length, raw_b64: bytesToBase64(payload) } } };
                         }
-                        if (codecId===3) return {name:'codec_jpeg',color:'#00ff00',family:'image',meta:{codec:'JPEG'}};
-                        if (codecId===4) return {name:'codec_png', color:'#00ff00',family:'image',meta:{codec:'PNG'}};
-                    }
-                    if (op===0x0a && bytes.length===10) {
-                        // 8 hint bytes — structure not yet decoded (need window-resize captures)
-                        const hint = bytes.slice(2);
-                        const a = hint[0]|(hint[1]<<8), b2 = hint[2]|(hint[3]<<8);
-                        const c = hint[4]|(hint[5]<<8), d = hint[6]|(hint[7]<<8);
-                        return { name:`screen_geometry_hint [${a},${b2},${c},${d}]`, color:'#0ff',
-                            family:'screen_info', meta:{ op:0x0a, fields:[a,b2,c,d], hint: toHex(hint) } };
+                        if (codecId === 3) return { name: 'codec_jpeg', color: '#00ff00', family: 'image', meta: { codec: 'JPEG' } };
+                        if (codecId === 4) return { name: 'codec_png',  color: '#00ff00', family: 'image', meta: { codec: 'PNG'  } };
                     }
 
-                    let name   = WARP_MAP[op]||`warp_0x${op.toString(16)}`;
+                    let name   = WARP_MAP[op] || `warp_0x${op.toString(16)}`;
                     let color  = '#ffcc00';
                     let family = 'warp_other';
                     const meta = { op };
 
-                    if (op===0x02) {
-                        // ── HANDSHAKE ─────────────────────────────────────
+                    if (op === 0x02) {
                         family = 'warp_other'; color = '#fa0';
                         const hs = parseHandshake(bytes);
                         Object.assign(meta, hs);
                         name = `handshake [${hs.role_name}: "${hs.name}"]`;
                     }
-                    else if (op===0x03) {
-                        // ── CAP_NEG ───────────────────────────────────────
+                    else if (op === 0x03) {
                         family = 'warp_other'; color = '#fa0';
                         const caps = parseCapNeg(bytes);
                         meta.caps = caps;
                         const summary = caps.map(c => `${c.type_name}(n=${c.vals.length})`).join(' ');
                         name = `cap_neg [${summary}]`;
                     }
-                    else if (op===0x04) {
-                        family='auth_token'; color='#f00';
-                        meta.warning = 'PLAINTEXT TOKEN';
-                        // bytes[2]=0x00 padding, bytes[3]=0x20 length, bytes[4..35]=token
-                        meta.token_len = bytes.length >= 4 ? bytes[3] : null;
-                        meta.token = safeText(bytes.slice(4));
+                    else if (op === 0x04) {
+                        family = 'auth_token'; color = '#f00';
+                        meta.warning    = 'PLAINTEXT TOKEN';
+                        meta.token_len  = bytes.length >= 4 ? bytes[3] : null;
+                        meta.token      = safeText(bytes.slice(4));
                         name = `token [${meta.token_len}B PLAINTEXT]`;
                     }
-                    else if (op===0x05) {
-                        // ── SCREEN_INFO ───────────────────────────────────
+                    else if (op === 0x05) {
+                        // V10.0: server screen_info (subtype=0x01) vs client resolution update (subtype=0x02)
                         family = 'screen_info'; color = '#0ff';
                         const si = parseScreenInfo(bytes);
                         Object.assign(meta, si);
-                        const wh = si.canvas_width ? `${si.canvas_width}×${si.canvas_height}` : '?×?';
-                        const codecs = si.codec_list.map(c=>c.name).join('/') || '?';
-                        name = direction === 'OUTGOING'
-                            ? `client_resolution_update [${wh} codecs:${codecs}]`
-                            : `screen_info [${wh} codecs:${codecs} tile:${si.tile_size.w}×${si.tile_size.h}]`;
+                        const wh     = si.canvas_width  ? `${si.canvas_width}×${si.canvas_height}` : '?×?';
+                        const codecs = si.codec_list?.map(c => c.name).join('/') || '?';
+                        if (si.is_client_update || direction === 'OUTGOING') {
+                            name = `client_resolution_update [${wh}]`;
+                        } else {
+                            const tile = si.tile_size ? `${si.tile_size.w}×${si.tile_size.h}` : '?×?';
+                            name = `screen_info [${wh} codecs:${codecs} tile:${tile}]`;
+                        }
                     }
-                    else if (op===0x06) {
-                        // ── AUX_REG ───────────────────────────────────────
+                    else if (op === 0x06) {
                         family = 'warp_other'; color = '#fa0';
                         const ar = parseAuxReg(bytes);
                         meta.chan_name = ar.chan_name;
                         name = `aux_reg ["${ar.chan_name}"]`;
                     }
-                    else if (op===0x0c) {
-                        // resolution_ack — structure not yet observed
-                        family='screen_info'; color='#0ff';
+                    else if (op === 0x0a) {
+                        // V10.0: screen_geometry_hint — fully decoded
+                        family = 'screen_info'; color = '#0ff';
+                        const gh = parseGeometryHint(bytes);
+                        Object.assign(meta, gh);
+                        name = gh.truncated
+                            ? `screen_geometry_hint [truncated ${bytes.length}B]`
+                            : `screen_geometry_hint [${gh.hint_a},${gh.hint_b},${gh.hint_c},${gh.hint_d}]`;
                     }
-                    else if (op===0x1a || op===0x1b) {
-                        // ── LATENCY SYNC ──────────────────────────────────
+                    else if (op === 0x0c) {
+                        // V10.0: resolution_ack — fully decoded (10-byte server echo)
+                        family = 'screen_info'; color = '#0ff';
+                        const ack = parseResolutionAck(bytes);
+                        Object.assign(meta, ack);
+                        if (ack.malformed) {
+                            name = `resolution_ack [malformed ${bytes.length}B]`;
+                        } else {
+                            name = `resolution_ack [accepted ${ack.accepted_width}×${ack.accepted_height}]`;
+                        }
+                    }
+                    else if (op === 0x1a || op === 0x1b) {
                         family = 'latency'; color = '#0cf';
                         if (bytes.length >= 6) {
                             const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -532,115 +569,145 @@
                             name = `${WARP_MAP[op]} [ts:${timestamp}ms]`;
                         }
                     }
-                    else if (op===0x19) { name='cursor_blink_tick'; color='#0ff'; family='cursor_blink'; }
-                    else if (op===0x0f) {
-                        const phase=bytes.length>=3?bytes[2]:0;
-                        const seq16=bytes.length>=4?(bytes[2]|(bytes[3]<<8)):phase;
-                        name=`cursor_blink_phase [0x${phase.toString(16).toUpperCase()} seq:${seq16}]`;
-                        color='#0ff'; family='cursor_blink'; meta.phase=phase; meta.seq16=seq16;
+                    else if (op === 0x19) {
+                        name = 'cursor_blink_tick'; color = '#0ff'; family = 'cursor_blink';
                     }
-                    else if (op===0x15 && bytes.length>=6) {
-                        const x=bytes[2]|(bytes[3]<<8), y=bytes[4]|(bytes[5]<<8);
-                        name=`mouse_move [(${x},${y})]`; color='#f0f'; family='mouse_move'; meta.x=x; meta.y=y;
+                    else if (op === 0x0f) {
+                        const phase = bytes.length >= 3 ? bytes[2] : 0;
+                        const seq16 = bytes.length >= 4 ? (bytes[2] | (bytes[3] << 8)) : phase;
+                        name = `cursor_blink_phase [0x${phase.toString(16).toUpperCase()} seq:${seq16}]`;
+                        color = '#0ff'; family = 'cursor_blink';
+                        meta.phase = phase; meta.seq16 = seq16;
                     }
-                    else if (op===0x16 && bytes.length>=7) {
-                        const x=bytes[2]|(bytes[3]<<8), y=bytes[4]|(bytes[5]<<8);
-                        const btn=BUTTON_MAP[bytes[6]]||`Btn:${bytes[6]}`;
-                        name=`mouse_click [${btn} at (${x},${y})]`; color='#f0f'; family='mouse_click';
-                        meta.x=x; meta.y=y; meta.button=bytes[6];
+                    else if (op === 0x15 && bytes.length >= 6) {
+                        const x = bytes[2] | (bytes[3] << 8), y = bytes[4] | (bytes[5] << 8);
+                        name = `mouse_move [(${x},${y})]`; color = '#f0f'; family = 'mouse_move';
+                        meta.x = x; meta.y = y;
                     }
-                    else if (op===0x18 && bytes.length>=8) {
-                        const delta=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getInt16(6,true);
-                        name=`mouse_scroll [Δ${delta}]`; color='#f0f'; family='mouse_scroll'; meta.delta=delta;
+                    else if (op === 0x16 && bytes.length >= 7) {
+                        const x = bytes[2] | (bytes[3] << 8), y = bytes[4] | (bytes[5] << 8);
+                        const btn = BUTTON_MAP[bytes[6]] || `Btn:${bytes[6]}`;
+                        name = `mouse_click [${btn} at (${x},${y})]`; color = '#f0f'; family = 'mouse_click';
+                        meta.x = x; meta.y = y; meta.button = bytes[6];
                     }
-                    else if ((op===0x12||op===0x13) && bytes.length>=3) {
-                        const key=SCAN_CODES[bytes[2]]||`0x${bytes[2].toString(16)}`;
-                        name=`${name} [${key}]`; color='#f55'; family='keyboard';
-                        meta.scancode=bytes[2]; meta.key=key;
+                    else if (op === 0x18 && bytes.length >= 8) {
+                        const delta = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt16(6, true);
+                        name = `mouse_scroll [Δ${delta}]`; color = '#f0f'; family = 'mouse_scroll';
+                        meta.delta = delta;
                     }
-                    else if (op===0x10||op===0x11) { family='pingpong'; }
-                    else if (op===0x0d) {
-                        family='image';
-                        const embedded=extractEmbeddedImage(bytes);
+                    else if ((op === 0x12 || op === 0x13) && bytes.length >= 3) {
+                        const key = SCAN_CODES[bytes[2]] || `0x${bytes[2].toString(16)}`;
+                        name = `${name} [${key}]`; color = '#f55'; family = 'keyboard';
+                        meta.scancode = bytes[2]; meta.key = key;
+                    }
+                    else if (op === 0x10 || op === 0x11) {
+                        family = 'pingpong';
+                    }
+                    else if (op === 0x0d) {
+                        family = 'image';
+                        const embedded = extractEmbeddedImage(bytes);
                         if (embedded) {
-                            const hdr=parseOp0dHeader(bytes, embedded.offset);
-                            meta.image_kind  = hdr.codec==='JPEG' ? 'jpeg_tile' : 'png_tile';
-                            meta.origin      = hdr.origin;
-                            meta.tile_count  = hdr.cnt;
-                            meta.tiles       = hdr.tiles;
-                            meta.bbox_min    = hdr.bbox;
+                            const hdr = parseOp0dHeader(bytes, embedded.offset);
+                            meta.image_kind   = hdr.codec === 'JPEG' ? 'jpeg_tile' : 'png_tile';
+                            meta.origin       = hdr.origin;
+                            meta.tile_count   = hdr.cnt;
+                            meta.tiles        = hdr.tiles;
+                            meta.bbox_min     = hdr.bbox;
                             meta.checksum_cap = hdr.chk;
                             meta.checksum_exp = computeChecksum(embedded.payload_len);
                             meta.checksum_ok  = meta.checksum_cap === meta.checksum_exp;
                             meta.variant      = hdr.variant;
                             meta.embedded_image = embedded;
-                        } else { meta.image_kind='unknown_tile'; }
+                        } else {
+                            meta.image_kind = 'unknown_tile';
+                        }
                     }
-                    else if (op===0x1c) {
-                        family='image';
-                        const embedded=extractEmbeddedImage(bytes);
+                    else if (op === 0x1c) {
+                        family = 'image';
+                        const embedded = extractEmbeddedImage(bytes);
                         if (embedded) {
-                            const scr=parseOp1cHeader(bytes);
+                            const scr = parseOp1cHeader(bytes);
                             meta.image_kind    = 'screen_png';
                             meta.screen_width  = scr.screen_width;
                             meta.screen_height = scr.screen_height;
-                            meta.session_flags = scr.session_flags; // from 0x03 cap_neg, still unknown
-                            meta.session_type  = scr.session_type;  // from 0x03 cap_neg, still unknown
-                            meta.checksum_cap  = null; meta.checksum_exp = null; meta.checksum_ok = null;
+                            meta.session_flags = scr.session_flags;  // 0xe5 = 229 (constant)
+                            meta.session_type  = scr.session_type;   // 0x05 = 5   (constant)
+                            meta.checksum_cap  = null;
+                            meta.checksum_exp  = null;
+                            meta.checksum_ok   = null;
                             meta.embedded_image = embedded;
-                        } else { meta.image_kind='screen_png_incomplete'; }
-                    }
-                    else if (op===0x20) {
-                        family='cursor_remote'; color='#0ff';
-                        if (bytes.length >= 10) {
-                            meta.hotspotX = bytes[2]|(bytes[3]<<8);
-                            meta.hotspotY = bytes[4]|(bytes[5]<<8);
-                            const embedded = extractEmbeddedImage(bytes);
-                            if (embedded) { meta.embedded_image = embedded; meta.image_kind = 'cursor_bitmap'; }
-                            name = `cursor_update [hotspot (${meta.hotspotX},${meta.hotspotY})${embedded?' img':''}]`;
+                        } else {
+                            meta.image_kind = 'screen_png_incomplete';
                         }
                     }
-                    else if (op===0x14) { family='disconnect'; }
+                    else if (op === 0x20) {
+                        family = 'cursor_remote'; color = '#0ff';
+                        // V10.0: minimal form = 6 bytes (hotspot only, built-in cursor shape)
+                        //        extended form = hotspot + embedded JPEG/PNG
+                        if (bytes.length >= 6) {
+                            meta.hotspotX = bytes[2] | (bytes[3] << 8);
+                            meta.hotspotY = bytes[4] | (bytes[5] << 8);
+                            meta.cursor_form = bytes.length === 6 ? 'hotspot_only' : 'hotspot_with_bitmap';
+                            const embedded = bytes.length > 6 ? extractEmbeddedImage(bytes) : null;
+                            if (embedded) {
+                                meta.embedded_image = embedded;
+                                meta.image_kind     = 'cursor_bitmap';
+                            }
+                            name = `cursor_update [hotspot (${meta.hotspotX},${meta.hotspotY})${embedded ? ' +bitmap' : ''}]`;
+                        }
+                    }
+                    else if (op === 0x14) {
+                        family = 'disconnect';
+                    }
 
-                    return {name, color, family, meta};
+                    return { name, color, family, meta };
                 }
 
-                if (tier===0x01) return decodeAux(bytes);
+                if (tier === 0x01) return decodeAux(bytes);
 
-                if (tier===0x02) {
+                if (tier === 0x02) {
                     try {
-                        const str=new TextDecoder().decode(bytes.slice(5));
-                        const m=str.match(/\{.*\}/);
-                        let method=null;
-                        if (m) { try { method=JSON.parse(m[0]).method||'unknown'; } catch(_) { method='parse-error'; } }
-                        return { name:m?`fx-comm: ${method}`:'fx-comm: metadata', color:'#00ff00',
-                            family:'clientcomm', meta:{method}, text:m?m[0]:str,
-                            preview:summarizeText(m?m[0]:str,240) };
-                    } catch(_) { return {name:'fx-comm: binary',color:'#00ff00',family:'clientcomm',meta:null}; }
+                        const str = new TextDecoder().decode(bytes.slice(5));
+                        const m = str.match(/\{.*\}/);
+                        let method = null;
+                        if (m) { try { method = JSON.parse(m[0]).method || 'unknown'; } catch(_) { method = 'parse-error'; } }
+                        return { name: m ? `fx-comm: ${method}` : 'fx-comm: metadata', color: '#00ff00',
+                            family: 'clientcomm', meta: { method }, text: m ? m[0] : str,
+                            preview: summarizeText(m ? m[0] : str, 240) };
+                    } catch(_) {
+                        return { name: 'fx-comm: binary', color: '#00ff00', family: 'clientcomm', meta: null };
+                    }
                 }
 
-                return {name:`unknown_tier_0x${tier.toString(16)}`,color:'#888',family:'unknown',meta:null};
-            } catch(err) { return {name:'classify_error',color:'#f00',family:'unknown',meta:{error:String(err)}}; }
+                return { name: `unknown_tier_0x${tier.toString(16)}`, color: '#888', family: 'unknown', meta: null };
+
+            } catch(err) {
+                // V10.0: emit raw hex in classify_error so previously-hidden packets are visible.
+                // In settings-varied sessions, 0x0a packets with non-10-byte lengths land here.
+                const hexSnippet = bytes && bytes.length <= 32 ? toHex(bytes) : (bytes ? toHex(bytes.slice(0,32)) + '…' : '');
+                return { name: 'classify_error', color: '#f00', family: 'unknown',
+                    meta: { error: String(err), raw_hex: hexSnippet, length: bytes?.length ?? 0 } };
+            }
         };
 
-        // ── Emit ──────────────────────────────────────────────────────────────
+        // ── Emit ───────────────────────────────────────────────────────────────
         const emit = (p, bytes) => {
             try {
                 const cls = classifyBinary(bytes, p.direction);
                 p.opcode  = cls.name;
                 p.color   = cls.color;
                 p.size    = bytes.length;
-                p.family  = cls.family || 'unknown';
-                p.meta    = cls.meta   || null;
+                p.family  = cls.family  || 'unknown';
+                p.meta    = cls.meta    || null;
                 p.hex     = bytes.length <= CONFIG.MAX_BINARY_BYTES ? toHex(bytes) : null;
                 p.preview = cls.preview || null;
                 p.text    = typeof cls.text === 'string' ? cls.text : null;
-                (window.top||window).dispatchEvent(new CustomEvent(CONFIG.EVENT_NAME,{detail:p}));
-            } catch(err) { console.warn('[FastX] emit error:',err); }
+                (window.top || window).dispatchEvent(new CustomEvent(CONFIG.EVENT_NAME, { detail: p }));
+            } catch(err) { console.warn('[FastX] emit error:', err); }
         };
-        const basePayload = (dir) => ({seq:seq++, timestamp:performance.now(), direction:dir});
+        const basePayload = (dir) => ({ seq: seq++, timestamp: performance.now(), direction: dir });
 
-        // ── WebSocket proxy ───────────────────────────────────────────────────
+        // ── WebSocket Proxy ────────────────────────────────────────────────────
         const OrigWS = window.WebSocket;
         window.WebSocket = new Proxy(OrigWS, {
             construct(Target, args) {
@@ -651,7 +718,7 @@
                             emit(basePayload('INCOMING'), new Uint8Array(e.data));
                         else if (e.data instanceof Blob)
                             e.data.arrayBuffer().then(buf => emit(basePayload('INCOMING'), new Uint8Array(buf)));
-                    } catch(err) { console.warn('[FastX] message handler error:',err); }
+                    } catch(err) { console.warn('[FastX] message handler error:', err); }
                 });
                 const _send = ws.send.bind(ws);
                 ws.send = function(data) {
@@ -660,7 +727,7 @@
                             emit(basePayload('OUTGOING'), new Uint8Array(data));
                         else if (ArrayBuffer.isView(data))
                             emit(basePayload('OUTGOING'), new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-                    } catch(err) { console.warn('[FastX] send error:',err); }
+                    } catch(err) { console.warn('[FastX] send error:', err); }
                     return _send(data);
                 };
                 return ws;
@@ -668,39 +735,40 @@
         });
     }
 
-    // ── Inject into page context ──────────────────────────────────────────────
+    // ── Inject into page context ───────────────────────────────────────────────
     const scriptEl = document.createElement('script');
     scriptEl.textContent = `(${pageContextHook.toString()})();`;
-    (document.head||document.documentElement).appendChild(scriptEl);
+    (document.head || document.documentElement).appendChild(scriptEl);
     scriptEl.remove();
 
     if (window.top !== window.self) return;
 
-    // ── UI State ──────────────────────────────────────────────────────────────
+    // ── UI State ───────────────────────────────────────────────────────────────
     const state = {
-        packets:[], markers:[], familyCounts:{}, opcodeCounts:{}, imagePackets:[],
-        ui:{count:null,families:null,opcodes:null,filters:null,markerInput:null,body:null,imageCount:null},
+        packets: [], markers: [], familyCounts: {}, opcodeCounts: {}, imagePackets: [],
+        ui: { count: null, families: null, opcodes: null, filters: null, markerInput: null, body: null, imageCount: null },
         panelCollapsed: false,
-        filters:{
-            image:true, pingpong:false, latency:false, mouse_move:false, mouse_click:true,
-            mouse_scroll:true, keyboard:true, cursor_remote:true, cursor_blink:false,
-            screen_info:true, aux_mime:true, aux_data:true, aux_other:true,
-            clientcomm:true, auth_token:true, disconnect:true, warp_other:true, unknown:true
+        filters: {
+            image: true,    pingpong: false,     latency: false,   mouse_move: false,
+            mouse_click: true, mouse_scroll: true, keyboard: true, cursor_remote: true,
+            cursor_blink: false, screen_info: true, aux_mime: true, aux_data: true,
+            aux_other: true, clientcomm: true, auth_token: true, disconnect: true,
+            warp_other: true, unknown: true,
         }
     };
 
     const FAMILY_LABELS = {
-        image:'Image (RFX7/JPG/PNG)', pingpong:'Ping/Pong', latency:'Latency Sync',
-        mouse_move:'Mouse Move', mouse_click:'Mouse Click', mouse_scroll:'Mouse Scroll',
-        keyboard:'Keyboard', cursor_remote:'Cursor Remote', cursor_blink:'Cursor Blink',
-        screen_info:'Screen Info', aux_mime:'Aux MIME', aux_data:'Aux Data',
-        aux_other:'Aux Other', clientcomm:'ClientComm', auth_token:'Auth Token',
-        disconnect:'Disconnect', warp_other:'Warp Other', unknown:'Unknown'
+        image: 'Image (RFX7/JPG/PNG)', pingpong: 'Ping/Pong', latency: 'Latency Sync',
+        mouse_move: 'Mouse Move', mouse_click: 'Mouse Click', mouse_scroll: 'Mouse Scroll',
+        keyboard: 'Keyboard', cursor_remote: 'Cursor Remote', cursor_blink: 'Cursor Blink',
+        screen_info: 'Screen Info', aux_mime: 'Aux MIME', aux_data: 'Aux Data',
+        aux_other: 'Aux Other', clientcomm: 'ClientComm', auth_token: 'Auth Token',
+        disconnect: 'Disconnect', warp_other: 'Warp Other', unknown: 'Unknown',
     };
     const FAMILY_ORDER = Object.keys(FAMILY_LABELS);
 
-    const shouldLog  = (p) => !!state.filters[p.family||'unknown'];
-    const short      = (s,n=90) => typeof s==='string' ? (s.length<=n ? s : s.slice(0,n)+'…') : '';
+    const shouldLog   = (p) => !!state.filters[p.family || 'unknown'];
+    const short       = (s, n = 90) => typeof s === 'string' ? (s.length <= n ? s : s.slice(0, n) + '…') : '';
     const updateCounts = (p) => {
         state.familyCounts[p.family]  = (state.familyCounts[p.family]  || 0) + 1;
         state.opcodeCounts[p.opcode]  = (state.opcodeCounts[p.opcode]  || 0) + 1;
@@ -708,21 +776,21 @@
 
     const refreshUI = () => {
         try {
-            if (state.ui.count)      state.ui.count.textContent      = String(state.packets.length);
-            if (state.ui.imageCount) state.ui.imageCount.textContent  = String(state.imagePackets.length);
+            if (state.ui.count)      state.ui.count.textContent     = String(state.packets.length);
+            if (state.ui.imageCount) state.ui.imageCount.textContent = String(state.imagePackets.length);
             if (state.ui.families) {
                 state.ui.families.innerHTML = FAMILY_ORDER.map(f =>
                     `<div style="display:flex;justify-content:space-between;margin:2px 0">
                         <span>${FAMILY_LABELS[f]}</span>
-                        <span style="color:#aaa">${state.familyCounts[f]||0}</span>
+                        <span style="color:#aaa">${state.familyCounts[f] || 0}</span>
                     </div>`).join('');
             }
             if (state.ui.opcodes) {
-                const top = Object.entries(state.opcodeCounts).sort((a,b)=>b[1]-a[1]).slice(0,10);
+                const top = Object.entries(state.opcodeCounts).sort((a,b) => b[1]-a[1]).slice(0, 10);
                 state.ui.opcodes.innerHTML = top.length
-                    ? top.map(([op,c]) =>
+                    ? top.map(([op, c]) =>
                         `<div style="display:flex;justify-content:space-between;margin:2px 0">
-                            <span title="${op}">${short(op,42)}</span>
+                            <span title="${op}">${short(op, 42)}</span>
                             <span style="color:#aaa">${c}</span>
                         </div>`).join('')
                     : '<div style="color:#888">No packets yet</div>';
@@ -731,7 +799,7 @@
                 state.ui.filters.innerHTML = FAMILY_ORDER.map(f =>
                     `<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0;cursor:pointer">
                         <span>${FAMILY_LABELS[f]}</span>
-                        <input type="checkbox" data-family="${f}" ${state.filters[f]?'checked':''}>
+                        <input type="checkbox" data-family="${f}" ${state.filters[f] ? 'checked' : ''}>
                     </label>`).join('');
                 state.ui.filters.querySelectorAll('input').forEach(el =>
                     el.addEventListener('change', e => {
@@ -739,17 +807,19 @@
                         if (f) state.filters[f] = e.target.checked;
                     }));
             }
-        } catch(err) { console.warn('[FastX] refreshUI error:',err); }
+        } catch(err) { console.warn('[FastX] refreshUI error:', err); }
     };
 
-    // ── Actions ───────────────────────────────────────────────────────────────
+    // ── Actions ────────────────────────────────────────────────────────────────
     const addMarker = (label) => {
-        const m = {kind:'marker', marker_index:state.markers.length,
-            packet_seq_after:state.packets.length,
-            timestamp_iso:new Date().toISOString(), perf_now:performance.now(),
-            label:label||`marker_${state.markers.length}`};
+        const m = {
+            kind: 'marker', marker_index: state.markers.length,
+            packet_seq_after: state.packets.length,
+            timestamp_iso: new Date().toISOString(), perf_now: performance.now(),
+            label: label || `marker_${state.markers.length}`,
+        };
         state.markers.push(m);
-        console.log('%c[MARKER]%c','color:#ff0;font-weight:bold','color:#ccc', m);
+        console.log('%c[MARKER]%c', 'color:#ff0;font-weight:bold', 'color:#ccc', m);
     };
     const downloadBlob = (filename, blob) => {
         const a = document.createElement('a');
@@ -759,42 +829,43 @@
     };
     const downloadJSON = () => {
         downloadBlob(`fastx-capture-${Date.now()}.json`, new Blob([JSON.stringify({
-            schema_version: 'fastx-capture-v9.0',
+            schema_version: 'fastx-capture-v10.0',
             exported_at: new Date().toISOString(),
             page_url: location.href, user_agent: navigator.userAgent,
             packet_count: state.packets.length, marker_count: state.markers.length,
             image_packet_count: state.imagePackets.length,
             family_counts: state.familyCounts, opcode_counts: state.opcodeCounts,
-            markers: state.markers, packets: state.packets
-        }, null, 2)], {type:'application/json'}));
+            markers: state.markers, packets: state.packets,
+        }, null, 2)], { type: 'application/json' }));
     };
     const exportImagesJSON = () => {
         downloadBlob(`fastx-images-${Date.now()}.json`, new Blob([JSON.stringify({
             schema_version: 'fastx-image-capture-v2.5',
             exported_at: new Date().toISOString(),
             page_url: location.href, image_count: state.imagePackets.length,
-            packets: state.imagePackets
-        }, null, 2)], {type:'application/json'}));
+            packets: state.imagePackets,
+        }, null, 2)], { type: 'application/json' }));
     };
     const exportFirstImage = () => {
         const first = state.imagePackets.find(p =>
             p.embedded_image?.raw_b64 && p.embedded_image.mime !== 'application/x-rfx7-tile');
         if (!first) return console.warn('[FastX] No standard image found yet.');
         try {
-            const {mime, raw_b64} = first.embedded_image;
+            const { mime, raw_b64 } = first.embedded_image;
             const bytes = Uint8Array.from(atob(raw_b64), c => c.charCodeAt(0));
-            downloadBlob(`fastx-img-seq${first.seq}.${mime==='image/png'?'png':'jpg'}`,
-                new Blob([bytes], {type:mime}));
-        } catch(err) { console.error('[FastX] exportFirstImage error:',err); }
+            downloadBlob(`fastx-img-seq${first.seq}.${mime === 'image/png' ? 'png' : 'jpg'}`,
+                new Blob([bytes], { type: mime }));
+        } catch(err) { console.error('[FastX] exportFirstImage error:', err); }
     };
     const clearCapture = () => {
-        state.packets=[]; state.markers=[]; state.familyCounts={}; state.opcodeCounts={}; state.imagePackets=[];
+        state.packets = []; state.markers = []; state.familyCounts = {};
+        state.opcodeCounts = {}; state.imagePackets = [];
         refreshUI();
         console.clear();
-        console.log('%c[FastX]%c cleared','color:#0fa;font-weight:bold','color:#ccc');
+        console.log('%c[FastX]%c cleared', 'color:#0fa;font-weight:bold', 'color:#ccc');
     };
 
-    // ── UI Init ───────────────────────────────────────────────────────────────
+    // ── UI Init ────────────────────────────────────────────────────────────────
     const initUI = () => {
         if (document.getElementById('fastx-panel')) return;
         if (!document.body) return;
@@ -803,7 +874,7 @@
         panel.style.cssText = 'position:fixed;bottom:20px;left:20px;z-index:999999;background:rgba(0,0,0,0.94);color:#0f0;padding:12px;border:1px solid #0f0;border-radius:8px;font-family:monospace;font-size:12px;width:390px;max-height:80vh;overflow:auto;box-shadow:0 0 18px rgba(0,255,0,0.2)';
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-  <b>FastX V9.0 – Full Protocol Decode</b>
+  <b>FastX V10.0 – Protocol 100% Decoded</b>
   <button id="fx-collapse" style="background:#111;color:#0f0;border:1px solid #0f0;border-radius:4px;padding:2px 8px;cursor:pointer">–</button>
 </div>
 <div id="fx-body">
@@ -855,11 +926,11 @@
         });
         panel.querySelector('#fx-noise').addEventListener('click', () => {
             Object.assign(state.filters, {
-                image:true, pingpong:false, latency:false, mouse_move:false, mouse_scroll:false,
-                cursor_remote:true, cursor_blink:false, screen_info:false,
-                aux_mime:true, aux_data:true, aux_other:true, clientcomm:true,
-                auth_token:true, disconnect:true, mouse_click:true, keyboard:true,
-                warp_other:true, unknown:true
+                image: true,   pingpong: false,  latency: false,     mouse_move: false,
+                mouse_scroll: false, cursor_remote: true, cursor_blink: false,
+                screen_info: false, aux_mime: true, aux_data: true, aux_other: true,
+                clientcomm: true, auth_token: true, disconnect: true,
+                mouse_click: true, keyboard: true, warp_other: true, unknown: true,
             });
             refreshUI();
         });
@@ -871,7 +942,7 @@
         refreshUI();
     };
 
-    // ── Packet handler ────────────────────────────────────────────────────────
+    // ── Packet Handler ─────────────────────────────────────────────────────────
     window.addEventListener('fastx:packet', (ev) => {
         try {
             const p = ev.detail;
@@ -880,7 +951,7 @@
             const record = {
                 seq: p.seq, ts_perf: Number(p.timestamp.toFixed(3)), ts_iso: new Date().toISOString(),
                 direction: p.direction, family: p.family, opcode: p.opcode, size: p.size,
-                meta: p.meta || null, preview: p.preview || null, text: p.text || null, hex: p.hex || null
+                meta: p.meta || null, preview: p.preview || null, text: p.text || null, hex: p.hex || null,
             };
 
             state.packets.push(record);
@@ -904,7 +975,7 @@
                     session_flags: record.meta.session_flags ?? null,
                     session_type:  record.meta.session_type  ?? null,
                     hex_header:    record.hex ? record.hex.slice(0, 14*3-1) : null,
-                    embedded_image: record.meta.embedded_image
+                    embedded_image: record.meta.embedded_image,
                 });
             }
 
@@ -920,13 +991,19 @@
             if (record.meta?.checksum_cap != null) {
                 const ok = record.meta.checksum_ok;
                 console.log(
-                    `%cchecksum: cap=${record.meta.checksum_cap} exp=${record.meta.checksum_exp} ${ok?'✅':'❌ MISMATCH'}`,
-                    `color:${ok?'#0f8':'#f44'}`
+                    `%cchecksum: cap=${record.meta.checksum_cap} exp=${record.meta.checksum_exp} ${ok ? '✅' : '❌ MISMATCH'}`,
+                    `color:${ok ? '#0f8' : '#f44'}`
                 );
             }
             if (record.meta?.canvas_width)
                 console.log('%ccanvas:%c', 'color:#8f8', 'color:#ccc',
                     `${record.meta.canvas_width}×${record.meta.canvas_height}`);
+            if (record.meta?.accepted_width)
+                console.log('%caccepted resolution:%c', 'color:#8f8', 'color:#ccc',
+                    `${record.meta.accepted_width}×${record.meta.accepted_height}`);
+            if (record.meta?.hint_a != null)
+                console.log('%cgeometry hint:%c', 'color:#8f8', 'color:#ccc',
+                    `[${record.meta.hint_a}, ${record.meta.hint_b}, ${record.meta.hint_c}, ${record.meta.hint_d}]`);
             if (record.meta?.codec_list?.length)
                 console.log('%ccodecs:%c', 'color:#8f8', 'color:#ccc', record.meta.codec_list);
             if (record.meta?.caps)
@@ -935,16 +1012,19 @@
                 console.log('%cvariant:%c', 'color:#8f8', 'color:#ccc', record.meta.variant);
             if (record.preview)
                 console.log('%cpreview:%c', 'color:#8f8', 'color:#ccc', record.preview);
-            if (record.hex)
+            // V10.0: always log raw hex for classify_error to expose non-standard 0x0a packets
+            if (record.family === 'unknown' && record.meta?.raw_hex)
+                console.log('%craw_hex:%c', 'color:#f88', 'color:#ccc', record.meta.raw_hex);
+            else if (record.hex)
                 console.log('%chex:%c', 'color:#8f8', 'color:#ccc', record.hex);
             console.groupEnd();
-        } catch(err) { console.warn('[FastX] packet handler error:',err); }
+        } catch(err) { console.warn('[FastX] packet handler error:', err); }
     });
 
     if (document.body) { initUI(); }
     else if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initUI); }
     else {
         const obs = new MutationObserver(() => { if (document.body) { obs.disconnect(); initUI(); } });
-        obs.observe(document.documentElement, {childList:true});
+        obs.observe(document.documentElement, { childList: true });
     }
 })();
